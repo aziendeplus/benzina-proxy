@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8">
+  <title>Benzinai fuori dal casello (uscita + prezzo)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <style>
+    body{margin:0;font-family:sans-serif}
+    #map{height:55vh;width:100%}
+    .panel{padding:1rem}
+    input,button{padding:.6rem;font-size:1rem;margin:.25rem 0;width:100%}
+    .card{border-left:4px solid #2563eb;margin:.4rem 0;padding:.4rem;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.1)}
+    small{color:#555;font-size:.8rem}
+  </style>
+</head>
+<body>
+  <div class="panel">
+    <h2>Benzinai fuori dal casello (uscita + prezzo)</h2>
+    <input id="from" placeholder="Città di partenza">
+    <input id="to" placeholder="Città di arrivo">
+    <button id="search">Cerca</button>
+    <p id="status" style="color:red;height:1.2rem"></p>
+  </div>
+  <div id="map"></div>
+  <div class="panel"><h3>Stazioni trovate</h3><div id="results"></div></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const map = L.map('map').setView([42,12],6);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19}).addTo(map);
+    const statusEl = document.getElementById('status'),
+          resultsEl = document.getElementById('results');
+    let markers = [], routeLine;
+
+    function setStatus(msg){ statusEl.textContent = msg }
+
+    async function geocode(q){
+      const r = await fetch('https://nominatim.openstreetmap.org/search?format=json&limit=1&q='+encodeURIComponent(q));
+      const d = await r.json();
+      if (!d.length) throw 'Località "'+q+'" non trovata';
+      return { lat:+d[0].lat, lon:+d[0].lon };
+    }
+    async function route(a,b){
+      const r = await fetch(
+        `https://router.project-osrm.org/route/v1/driving/${a.lon},${a.lat};${b.lon},${b.lat}` +
+        `?overview=full&geometries=geojson`
+      );
+      const d = await r.json();
+      if (!d.routes.length) throw 'Percorso non trovato';
+      return d.routes[0];
+    }
+    async function overpassFuel(lat,lon){
+      const q = `[out:json][timeout:25];node["amenity"="fuel"](around:3000,${lat},${lon});out center;`;
+      const r = await fetch('https://overpass.kumi.systems/api/interpreter',{method:'POST',body:q});
+      const d = await r.json();
+      return d.elements;
+    }
+    async function overpassExit(lat,lon){
+      const q = `[out:json][timeout:25];node["highway"="motorway_junction"](around:2000,${lat},${lon});out;`;
+      const r = await fetch('https://overpass.kumi.systems/api/interpreter',{method:'POST',body:q});
+      const d = await r.json();
+      return d.elements[0];
+    }
+    function haversine(lat1,lon1,lat2,lon2){
+      const R=6371000, toRad=g=>g*Math.PI/180;
+      const dLat=toRad(lat2-lat1), dLon=toRad(lon2-lon1);
+      const a = Math.sin(dLat/2)**2 +
+                Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*
+                Math.sin(dLon/2)**2;
+      return 2*R*Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+    }
+    async function prezzo(lat,lon){
+      try {
+        const r = await fetch(`/prezzo?lat=${lat}&lng=${lon}`);
+        const d = await r.json();
+        const imp = d.elencoCarburanti?.[0];
+        return imp?.prezzoBenzina || imp?.prezzoGasolio || 'N/D';
+      } catch {
+        return 'N/D';
+      }
+    }
+
+    document.getElementById('search').onclick = async ()=>{
+      resultsEl.innerHTML = '';
+      if (routeLine) map.removeLayer(routeLine);
+      markers.forEach(m=>map.removeLayer(m));
+      markers = [];
+
+      const from = document.getElementById('from').value.trim();
+      const to   = document.getElementById('to').value.trim();
+      if (!from || !to) { setStatus('Inserisci entrambe le città'); return; }
+
+      try {
+        setStatus('Geocoding…');
+        const a = await geocode(from), b = await geocode(to);
+
+        setStatus('Calcolo percorso…');
+        const rt = await route(a,b);
+        routeLine = L.polyline(rt.geometry.coordinates.map(c=>[c[1],c[0]]),{color:'blue'}).addTo(map);
+        map.fitBounds(routeLine.getBounds());
+
+        setStatus('Recupero stazioni e prezzi…');
+        const exits = rt.geometry.coordinates.filter((_,i)=>i%12===0);
+        let count = 0, seen = {};
+        for (const [lonE,latE] of exits){
+          const exitInfo = await overpassExit(latE,lonE);
+          const exitName = exitInfo ? (exitInfo.tags.ref || exitInfo.tags.name) : 'casello';
+          const st = await overpassFuel(latE,lonE);
+          for (const s of st){
+            if (seen[s.id]) continue;
+            seen[s.id] = true;
+            const latS = s.lat||s.center.lat, lonS = s.lon||s.center.lon;
+            const dist = (haversine(latE,lonE,latS,lonS)/1000).toFixed(1);
+            const nome = s.tags?.name || 'Stazione';
+            const pr   = await prezzo(latS,lonS);
+            markers.push(L.marker([latS,lonS]).addTo(map).bindPopup(nome));
+            const div = document.createElement('div');
+            div.className = 'card';
+            div.innerHTML = `${nome}<br><small>${dist} km da uscita “${exitName}” – prezzo: ${pr}</small>`;
+            resultsEl.appendChild(div);
+            count++;
+          }
+        }
+        setStatus(count? count+' stazioni trovate':'Nessuna stazione trovata');
+      } catch (e) {
+        setStatus(e);
+      }
+    };
+  </script>
+</body>
+</html>
